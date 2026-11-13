@@ -78,6 +78,15 @@ param(
     [int]$ButtonCheckSeconds    = 5,
     [int]$ButtonRetryCount      = 3,
     [int]$ButtonRetrySeconds    = 20,
+    # In-app update. When XM offers a newer build, step 1 presses "download
+    # locally" instead of "continue with this version"; the script then waits for
+    # the dialog that says the download has finished, presses OK (XM closes
+    # itself at that point), relaunches the freshly downloaded exe and starts
+    # over at step 1.
+    [int]$UpdateDownloadSeconds = 900,      # wait for "download finished" + OK
+    [int]$UpdateExitSeconds     = 90,       # wait for XM to close after OK
+    [int]$UpdateRestartLimit    = 3,        # update rounds before giving up
+    [int]$UpdateSettleSeconds   = 20,       # after XM closes, wait this long for the new exe
     # Wait for the start line. Measured: after clicking "start", XM needs roughly
     # 40-60s before the log box appears and fills in, so 60s was too tight and the
     # detection window closed right before the log became readable.
@@ -135,6 +144,13 @@ $P_FAILMSG   = U @(0x4EFB,0x52A1,0x5931,0x8D25)
 #   U+7EE7 U+7EED U+4F7F U+7528 U+8BE5 U+7248 U+672C -> continue with this version
 $P_UPDATE_NOTIFY = (U @(0x6709,0x65B0,0x7248,0x672C)) + (U @(0xFF0C)) +
                    (U @(0x7EE7,0x7EED,0x4F7F,0x7528,0x8BE5,0x7248,0x672C))
+# Notification when the update prompt offers a download and the script takes it:
+#   U+6709 U+65B0 U+7248 U+672C U+FF0C U+6B63 U+5728 U+4E0B U+8F7D U+5E76 U+91CD U+542F
+#   -> "a new version is available, downloading it and restarting"
+$P_UPDATE_DOWNLOAD = U @(0x6709,0x65B0,0x7248,0x672C,0xFF0C,0x6B63,0x5728,0x4E0B,0x8F7D,0x5E76,0x91CD,0x542F)
+
+# (The marker that identifies the "download finished" dialog lives in
+# click_ui.ps1, because -ScopeDownloaded is evaluated there.)
 # U+4EFB U+52A1 U+6267 U+884C U+8D85 U+65F6 U+FF0C U+672A U+68C0 U+6D4B U+5230 U+5B8C U+6210 U+63D0 U+793A
 $P_TIMEMSG   = U @(0x4EFB,0x52A1,0x6267,0x884C,0x8D85,0x65F6,0xFF0C,0x672A,0x68C0,
                    0x6D4B,0x5230,0x5B8C,0x6210,0x63D0,0x793A)
@@ -252,15 +268,55 @@ function Resolve-XmPath {
     return (Join-Path $v 'XM.exe')
 }
 
+function Resolve-XmExePath {
+    # Where is the game right now? Same priorities as at start-up, and it is run
+    # AGAIN after an in-app update: the download drops a newer exe into the same
+    # folder, so re-resolving the path is what switches the script to the new
+    # build.
+    #
+    # -PreferNewerInFolder matters when xm_path.txt names ONE specific exe: the
+    # download lands NEXT TO it under its own versioned name, so looking only at
+    # the configured file would restart the old build forever - which is exactly
+    # the "downloads the same version again and again" loop.
+    param([switch]$PreferNewerInFolder)
+
+    $v = ''
+    if ($XmExeOverride) {
+        $v = Resolve-XmPath -Value $XmExeOverride
+    } elseif (Test-Path -LiteralPath $XmPathFile) {
+        $raw = ''
+        try { $raw = (Get-Content -LiteralPath $XmPathFile -Raw -ErrorAction Stop) } catch {}
+        $line = ($raw -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 -and -not $_.Trim().StartsWith('#') } | Select-Object -First 1)
+        $v = Resolve-XmPath -Value $line
+    }
+    if (-not $v) { $v = $DefaultXmExe }
+
+    if ($PreferNewerInFolder -and $v -and (Test-Path -LiteralPath $v -PathType Leaf)) {
+        $dir = Split-Path -Parent $v
+        if ($dir) {
+            $cand = Select-XmExeInFolder $dir
+            if ($cand -and $cand -ne $v) {
+                $tNew = $null
+                $tOld = $null
+                try { $tNew = (Get-Item -LiteralPath $cand).LastWriteTime } catch {}
+                try { $tOld = (Get-Item -LiteralPath $v).LastWriteTime } catch {}
+                if (-not $tOld) { return $cand }
+                if ($tNew -and $tNew -gt $tOld) {
+                    Write-Log ('  a newer build is in that folder: ' + $cand)
+                    return $cand
+                }
+            }
+        }
+    }
+    return $v
+}
+
 if ($XmExeOverride) {
     $XmExe = Resolve-XmPath -Value $XmExeOverride
     $XmSource = '-XmExeOverride argument'
 } elseif (Test-Path -LiteralPath $XmPathFile) {
-    $raw = ''
-    try { $raw = (Get-Content -LiteralPath $XmPathFile -Raw -ErrorAction Stop) } catch {}
-    $line = ($raw -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 -and -not $_.Trim().StartsWith('#') } | Select-Object -First 1)
-    $resolved = Resolve-XmPath -Value $line
-    if ($resolved) {
+    $resolved = Resolve-XmExePath
+    if ($resolved -and $resolved -ne $DefaultXmExe) {
         $XmExe = $resolved
         $XmSource = 'xm_path.txt'
     } else {
@@ -272,9 +328,14 @@ if ($XmExeOverride) {
 # XM is not always named XM.exe: a renamed copy such as "XM 3564.exe" runs as the
 # process "XM 3564". Every lookup below has to use that name, otherwise the script
 # launches the game and then waits forever for a process it keeps calling "XM".
+# Re-run after an update, because the downloaded build may have another name.
+function Update-XmProcName {
+    $script:XmProcName = ''
+    try { $script:XmProcName = [System.IO.Path]::GetFileNameWithoutExtension($script:XmExe) } catch {}
+    if (-not $script:XmProcName) { $script:XmProcName = 'XM' }
+}
 $XmProcName = ''
-try { $XmProcName = [System.IO.Path]::GetFileNameWithoutExtension($XmExe) } catch {}
-if (-not $XmProcName) { $XmProcName = 'XM' }
+Update-XmProcName
 
 function Get-XMProcess {
     # Find the game's processes. Get-Process -Name does WILDCARD matching, so a
@@ -453,10 +514,14 @@ function Invoke-ButtonClick {
     # happens as soon as the control is ready, plus -SettleSeconds. That is what
     # makes this far faster than the old fixed 60s sleeps.
     param(
-        [ValidateSet('enter', 'login', 'start')][string]$Key,
+        [ValidateSet('enter', 'login', 'start', 'download', 'confirm')][string]$Key,
         [int]$TimeoutSeconds = 180,
         [int]$FallbackX = 0,
-        [int]$FallbackY = 0
+        [int]$FallbackY = 0,
+        # Only press an OK button that belongs to the "download finished" dialog.
+        [switch]$ScopeDownloaded,
+        # Prefer "continue with this version" over "download locally".
+        [switch]$PreferOldBuild
     )
     if ($UseFixedCoords) {
         Write-Log ('  -UseFixedCoords: clicking fixed pixel (' + $FallbackX + ',' + $FallbackY + ')')
@@ -473,6 +538,8 @@ function Invoke-ButtonClick {
     # child as a bare "-ProcessName" and make it fail to bind the parameter.
     $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ui, '-Key', $Key, '-Wait',
                 '-TimeoutSeconds', $TimeoutSeconds, '-SettleSeconds', $SettleSeconds)
+    if ($ScopeDownloaded) { $psArgs += '-ScopeDownloaded' }
+    if ($PreferOldBuild) { $psArgs += '-PreferOldBuild' }
     if ($script:XmProcName) { $psArgs += @('-ProcessName', $script:XmProcName) }
     $out = & powershell @psArgs 2>&1
     $rc = $LASTEXITCODE
@@ -499,7 +566,7 @@ function Test-ButtonPresent {
     # raises a hidden/covered XM window once when nothing matches, which is what
     # keeps a covered window from looking like a control that went away.
     param([string]$Key)
-    if ($Key -notin @('enter', 'login', 'start')) { return $false }
+    if ($Key -notin @('enter', 'login', 'start', 'download', 'confirm')) { return $false }
 
     $ui = Join-Path $Bin 'click_ui.ps1'
     if (-not (Test-Path -LiteralPath $ui)) { return $false }
@@ -529,7 +596,10 @@ function Invoke-StepWithCheck {
         [string]$PrevKey = '',
         [int]$TimeoutSeconds = 180,
         [int]$FallbackX = 0,
-        [int]$FallbackY = 0
+        [int]$FallbackY = 0,
+        # Passed through to click_ui.ps1: prefer the "continue with this version"
+        # button when an update prompt offers both.
+        [switch]$PreferOldBuild
     )
 
     # Without a usable UIA helper (or with -UseFixedCoords) there is nothing to
@@ -566,7 +636,8 @@ function Invoke-StepWithCheck {
         if ($i -gt 1) { $wait = $ButtonRetrySeconds }
 
         if (-not (Invoke-ButtonClick -Key $Key -TimeoutSeconds $wait `
-                                     -FallbackX $FallbackX -FallbackY $FallbackY)) {
+                                     -FallbackX $FallbackX -FallbackY $FallbackY `
+                                     -PreferOldBuild:$PreferOldBuild)) {
             # Never found. If it is gone as well, it simply vanished while we
             # were looking - i.e. the earlier press did land after all.
             if (-not (Test-ButtonPresent -Key $Key)) {
@@ -574,6 +645,15 @@ function Invoke-StepWithCheck {
                 return $true
             }
             return $false
+        }
+
+        # The download button of the update prompt does NOT disappear when it is
+        # pressed - XM stays on that screen while it downloads - so the normal
+        # "the button must be gone" confirmation would press it again and again.
+        # Report it as done; the caller drives the rest of the update.
+        if ($script:LastClickedKey -eq 'download') {
+            Write-Log '  the update prompt was clicked: the new build is downloading'
+            return $true
         }
 
         Start-Sleep -Seconds $ButtonCheckSeconds
@@ -587,6 +667,85 @@ function Invoke-StepWithCheck {
                    $ButtonRetryCount + ')') 'WARN'
     }
     return $false
+}
+
+function Invoke-UpdateDownloadRestart {
+    # The "download locally" button of the update prompt has just been pressed.
+    #
+    #   1. wait for the dialog that says the download has finished and press OK -
+    #      XM closes itself at that point;
+    #   2. wait for XM to really be gone;
+    #   3. re-resolve the exe (the download drops a newer build into the folder)
+    #      and launch it, so the caller can run step 1 again.
+    #
+    # Returns $true when XM is running again.
+    $ok = Invoke-ButtonClick -Key confirm -ScopeDownloaded -TimeoutSeconds 30
+    if (-not $ok) {
+        # Either the dialog is not up yet, or its text is not exposed to UI
+        # Automation. Fall back to any OK button after that short grace period.
+        Write-Log '  no "download finished" dialog yet -> waiting for any OK button'
+        $ok = Invoke-ButtonClick -Key confirm -TimeoutSeconds $UpdateDownloadSeconds
+    }
+    if (-not $ok) {
+        Write-Log 'the download never reported that it had finished (no OK button)' 'ERROR'
+        return $false
+    }
+    Write-Log '  download finished; OK pressed, XM closes now'
+
+    $deadline = (Get-Date).AddSeconds($UpdateExitSeconds)
+    while (@(Get-XMProcess).Count -gt 0 -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+    }
+    $left = @(Get-XMProcess)
+    if ($left.Count -gt 0) {
+        Write-Log ('  XM is still running ' + $UpdateExitSeconds + 's after OK -> closing it') 'WARN'
+        foreach ($p in $left) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Start-Sleep -Seconds 3
+    }
+
+    # The updater may need a moment after its window is gone to put the new file
+    # in place, so WAIT for it instead of deciding right away - deciding too early
+    # is what relaunched the old build and downloaded the same version again.
+    $before = $script:XmExe
+    $beforeTime = $null
+    try { $beforeTime = (Get-Item -LiteralPath $before).LastWriteTime } catch {}
+
+    $gotNew = $false
+    $settle = (Get-Date).AddSeconds($UpdateSettleSeconds)
+    while ($true) {
+        $cand = Resolve-XmExePath -PreferNewerInFolder
+        if ($cand -and $cand -ne $before) { $script:XmExe = $cand; $gotNew = $true; break }
+        if ($beforeTime) {
+            $now = $null
+            try { $now = (Get-Item -LiteralPath $before).LastWriteTime } catch {}
+            if ($now -and $now -gt $beforeTime) { $gotNew = $true; break }
+        }
+        if ((Get-Date) -ge $settle) { break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $script:XmExe) { $script:XmExe = $before }
+    Update-XmProcName
+    $script:UpdateApplied = $gotNew
+    if ($gotNew) {
+        Write-Log ('  switching to the downloaded build: ' + $script:XmExe)
+    } else {
+        Write-Log ('  the download did not put a newer exe in place; keeping ' + $script:XmExe) 'WARN'
+    }
+    if (-not (Test-Path -LiteralPath $script:XmExe)) {
+        Write-Log ('  the expected exe is missing: ' + $script:XmExe) 'ERROR'
+        return $false
+    }
+    try {
+        Start-Process -FilePath $script:XmExe | Out-Null
+    } catch {
+        Write-Log ('  could not launch it: ' + $_.Exception.Message) 'ERROR'
+        return $false
+    }
+    Write-Log ('  relaunched ' + $script:XmExe + '; waiting for step 1 again')
+    Start-Sleep -Seconds 2
+    return $true
 }
 
 function Get-NewVersionNotifyText {
@@ -1143,21 +1302,66 @@ if (-not $SkipLaunch) {
     }
     Start-Process -FilePath $XmExe | Out-Null
 
-    Write-Log '--- step 1/3: waiting for the "enter offline mode" button ---'
-    if (-not (Invoke-StepWithCheck -Key enter -TimeoutSeconds $EnterTimeoutSeconds `
-                                   -FallbackX $EnterX -FallbackY $EnterY)) {
-        Write-Log '"enter offline mode" never became clickable, or the click never took effect' 'ERROR'
-        Write-Log ("exit " + 4)
-        Write-ExitSummary -Code 4
-        exit 4
-    }
+    # ---- step 1, repeated after an in-app update -----------------------------
+    # Normally this runs once. When XM announces a newer version, step 1 clicks
+    # "download locally" instead of "continue with this version"; the script then
+    # finishes the download (OK closes XM), relaunches the new build and comes
+    # back here, so the same three steps run against the updated game.
+    $updateRounds = 0
+    # Once a download has been taken and no newer exe appeared, do NOT take that
+    # same download again: the prompt would come back, the same build would be
+    # fetched again, and the run would loop until the retry limit. Prefer
+    # "continue with this version" instead and play the daily with what we have.
+    $downloadAllowed = $true
+    while ($true) {
+        Write-Log '--- step 1/3: waiting for the "enter offline mode" button ---'
+        $script:LastClickedKey = ''
+        if (-not (Invoke-StepWithCheck -Key enter -TimeoutSeconds $EnterTimeoutSeconds `
+                                       -FallbackX $EnterX -FallbackY $EnterY `
+                                       -PreferOldBuild:(-not $downloadAllowed))) {
+            Write-Log '"enter offline mode" never became clickable, or the click never took effect' 'ERROR'
+            Write-Log ("exit " + 4)
+            Write-ExitSummary -Code 4
+            exit 4
+        }
 
-    # If the update prompt was the one we clicked, tell the user.
-    if ($script:LastClickedKey -eq 'enter_update') {
-        $uvMsg = Get-NewVersionNotifyText
-        Write-Log ('new-version prompt detected; notifying: ' + $uvMsg) 'WARN'
-        if (Send-Wecom -Text $uvMsg) { Write-Log 'new-version notification sent.' }
-        else { Write-Log 'new-version notification FAILED.' 'ERROR' }
+        # An OLD build offers nothing but "continue with this version": report it
+        # and carry on with the current build, as this script always did.
+        if ($script:LastClickedKey -eq 'enter_update') {
+            $uvMsg = Get-NewVersionNotifyText
+            Write-Log ('new-version prompt detected; notifying: ' + $uvMsg) 'WARN'
+            if (Send-Wecom -Text $uvMsg) { Write-Log 'new-version notification sent.' }
+            else { Write-Log 'new-version notification FAILED.' 'ERROR' }
+            break
+        }
+
+        # A CURRENT build offers "download locally": take the update, then start
+        # over with the new exe.
+        if ($script:LastClickedKey -ne 'download') { break }
+
+        $updateRounds++
+        Write-Log ('--- update prompt: downloading the new build (round ' + $updateRounds +
+                   '/' + $UpdateRestartLimit + ') ---')
+        if (Send-Wecom -Text $P_UPDATE_DOWNLOAD) { Write-Log 'update notification sent.' }
+        else { Write-Log 'update notification FAILED.' 'ERROR' }
+
+        if ($updateRounds -gt $UpdateRestartLimit) {
+            Write-Log 'the update prompt keeps coming back after downloading -> giving up' 'ERROR'
+            Write-Log ("exit " + 4)
+            Write-ExitSummary -Code 4
+            exit 4
+        }
+        if (-not (Invoke-UpdateDownloadRestart)) {
+            Write-Log 'the new build could not be downloaded or restarted' 'ERROR'
+            Write-Log ("exit " + 4)
+            Write-ExitSummary -Code 4
+            exit 4
+        }
+
+        if (-not $script:UpdateApplied) {
+            Write-Log 'the download did not change the game build -> continuing with the current version' 'WARN'
+            $downloadAllowed = $false
+        }
     }
 
     Write-Log '--- step 2/3: waiting for the "login" button ---'

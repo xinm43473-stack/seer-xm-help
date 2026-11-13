@@ -50,7 +50,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('enter', 'login', 'start')]
+    # 'download' = the "download locally" button of the new-version prompt,
+    # 'confirm'  = the OK button of the "download finished" dialog.
+    [ValidateSet('enter', 'login', 'start', 'download', 'confirm')]
     [string]$Key,
     [switch]$Wait,
     [int]$TimeoutSeconds = 180,
@@ -58,6 +60,18 @@ param(
     [switch]$DryRun,
     # Locate only: report whether the control exists, then exit. Never clicks.
     [switch]$Probe,
+    # Only accept a control that lives in a window whose text says the download
+    # has finished. Used together with -Key confirm: XM shows that OK button in several
+    # dialogs and only that one may be pressed.
+    #
+    # A switch instead of the text itself, because PowerShell 5.1 encodes native
+    # argv with the ANSI code page: Chinese passed to a child process arrives as
+    # mojibake. The marker is built from code points inside this script instead.
+    [switch]$ScopeDownloaded,
+    # Do not take an available update: prefer the "continue with this version"
+    # button over "download locally". Used after a download that did not actually
+    # produce a newer build, so the same version is not fetched over and over.
+    [switch]$PreferOldBuild,
     # Force a raise before clicking; the point check does this by itself whenever
     # the click would land on another window.
     [switch]$BringToFront,
@@ -69,6 +83,11 @@ $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 function U { param([int[]]$Codes) return (-join ($Codes | ForEach-Object { [char]$_ })) }
+
+# U+5DF2 U+4E0B U+8F7D U+5B8C U+6BD5 -> "downloaded". The completion dialog
+# reads "new version has been downloaded, go and try it", so this fragment
+# identifies that dialog and nothing else.
+$SCOPE_DOWNLOADED = U @(0x5DF2,0x4E0B,0x8F7D,0x5B8C,0x6BD5)
 
 # ---------------------------------------------------------------------------
 #  Label table. The FIRST entry is the preferred button; later entries are
@@ -89,6 +108,12 @@ $L_THISVER = U @(0x4F7F,0x7528,0x8BE5,0x7248,0x672C)
 
 $L_UPDATE = U @(0x7EE7,0x7EED,0x4F7F,0x7528,0x8BE5,0x7248,0x672C)
 
+# U+672C U+5730 U+4E0B U+8F7D -> "download locally" (the new-version prompt)
+$L_DOWNLOAD = U @(0x672C,0x5730,0x4E0B,0x8F7D)
+
+# U+786E U+5B9A -> the OK button of a message box
+$L_OK = U @(0x786E,0x5B9A)
+
 
 $L_LOGIN  = U @(0x767B,0x9646)
 $L_LOGIN2 = U @(0x767B,0x5F55)
@@ -96,16 +121,27 @@ $L_LOGIN2 = U @(0x767B,0x5F55)
 $L_START  = U @(0x5F00,0x59CB)
 
 $labelTable = @{
+    # Prio decides the order between entries of the same key: the final rank is
+    # (Prio * 10 + match kind), so an exact "download locally" (10) beats an
+    # exact "continue with this version" (20). The old prompt is kept only as a
+    # last resort for builds that offer no download button at all.
     'enter' = @(
-        [pscustomobject]@{ Key = 'enter';        Label = $L_ENTER;  Frags = @() }
-        [pscustomobject]@{ Key = 'enter_update'; Label = $L_UPDATE; Frags = @($L_CONT, $L_THISVER) }
+        [pscustomobject]@{ Key = 'enter';        Prio = 0; Label = $L_ENTER;    Frags = @() }
+        [pscustomobject]@{ Key = 'download';     Prio = 1; Label = $L_DOWNLOAD; Frags = @() }
+        [pscustomobject]@{ Key = 'enter_update'; Prio = 2; Label = $L_UPDATE;   Frags = @($L_CONT, $L_THISVER) }
     )
     'login' = @(
-        [pscustomobject]@{ Key = 'login'; Label = $L_LOGIN;  Frags = @() }
-        [pscustomobject]@{ Key = 'login'; Label = $L_LOGIN2; Frags = @() }
+        [pscustomobject]@{ Key = 'login'; Prio = 0; Label = $L_LOGIN;  Frags = @() }
+        [pscustomobject]@{ Key = 'login'; Prio = 0; Label = $L_LOGIN2; Frags = @() }
     )
     'start' = @(
-        [pscustomobject]@{ Key = 'start'; Label = $L_START; Frags = @() }
+        [pscustomobject]@{ Key = 'start'; Prio = 0; Label = $L_START; Frags = @() }
+    )
+    'download' = @(
+        [pscustomobject]@{ Key = 'download'; Prio = 0; Label = $L_DOWNLOAD; Frags = @() }
+    )
+    'confirm' = @(
+        [pscustomobject]@{ Key = 'confirm'; Prio = 0; Label = $L_OK; Frags = @() }
     )
 }
 $labelEntries = $labelTable[$Key]
@@ -164,9 +200,9 @@ function Find-Button {
     #
     # Ranking (lower wins), so the PREFERRED button always beats a fallback even
     # if the fallback is smaller/higher in the tree:
-    #     0 = exact label text
-    #     1 = name contains the label
-    #     2 + i = name contains fragment #i
+    #     Prio*10 + 0     = exact label text
+    #     Prio*10 + 1     = name contains the label
+    #     Prio*10 + 2 + i = name contains fragment #i
     # Within the same rank, the smallest control wins (the real button, not the
     # container around it).
     param([IntPtr]$Hwnd)
@@ -179,6 +215,27 @@ function Find-Button {
         $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
                              [System.Windows.Automation.Condition]::TrueCondition)
     } catch { return $null }
+
+    # Scope filter: the "download finished" dialog is recognised by its own
+    # text. XM uses that OK button in several dialogs, and pressing the wrong one would
+    # dismiss the wrong thing, so a control is only accepted from a window that
+    # actually carries the marker.
+    if ($ScopeDownloaded) {
+        $scopeOk = $false
+        try {
+            $wn = [string]$root.Current.Name
+            if ($wn -and $wn.Contains($SCOPE_DOWNLOADED)) { $scopeOk = $true }
+        } catch {}
+        if (-not $scopeOk) {
+            for ($s = 0; $s -lt $all.Count; $s++) {
+                try {
+                    $sn = [string]$all.Item($s).Current.Name
+                    if ($sn -and $sn.Contains($SCOPE_DOWNLOADED)) { $scopeOk = $true; break }
+                } catch {}
+            }
+        }
+        if (-not $scopeOk) { return $null }
+    }
 
     $best = $null
     for ($i = 0; $i -lt $all.Count; $i++) {
@@ -202,21 +259,28 @@ function Find-Button {
             if ($r.Width -le 1 -or $r.Height -le 1) { continue }
             if ($r.X -lt -100000 -or $r.Y -lt -100000) { continue }
 
-            # find this element's rank across all label entries
+            # find this element's rank across all label entries. Prio*10 keeps
+            # the preferred entry ahead of a fallback (see the label table).
             $rank = -1
             $mkey = ''
             for ($k = 0; $k -lt $labelEntries.Count; $k++) {
                 $le = $labelEntries[$k]
-                if ($le.Label -and $nm -eq $le.Label) { $rank = 0; $mkey = $le.Key; break }
-                if ($le.Label -and $nm.Contains($le.Label)) { $rank = 1; $mkey = $le.Key; break }
+                if ($le.Label -and $nm -eq $le.Label) { $rank = $le.Prio * 10; $mkey = $le.Key; break }
+                if ($le.Label -and $nm.Contains($le.Label)) { $rank = $le.Prio * 10 + 1; $mkey = $le.Key; break }
                 for ($f = 0; $f -lt $le.Frags.Count; $f++) {
                     if ($nm.Contains($le.Frags[$f])) {
-                        $rank = 2 + $f; $mkey = $le.Key; break
+                        $rank = $le.Prio * 10 + 2 + $f; $mkey = $le.Key; break
                     }
                 }
                 if ($rank -ge 0) { break }
             }
             if ($rank -lt 0) { continue }
+
+            # -PreferOldBuild pushes "download locally" behind every other entry,
+            # so a build that was already downloaded (and that did not change the
+            # exe on disk) is not fetched a second time: the caller then gets
+            # enter_update and carries on with the build it already has.
+            if ($PreferOldBuild -and $mkey -eq 'download') { $rank = 90 + ($rank % 10) }
 
             $enabled = $true
             try { $enabled = [bool]$e.Current.IsEnabled } catch { $enabled = $true }
